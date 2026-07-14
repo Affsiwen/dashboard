@@ -151,7 +151,60 @@ function overview(o){
   const ins=insights(o);
   const trend=`<div class="panel"><h3>Daily cost</h3><div style="height:200px"><canvas id="byday"></canvas></div></div>`;
   const kinds=`<div class="panel"><h3>By operation kind</h3><table><tr><th>kind</th><th class="r">requests</th><th class="r">cost</th><th class="r">share</th></tr>${(o.by_kind||[]).map(k=>`<tr><td>${esc(k.kind)}</td><td class="r">${n(k.reqs)}</td><td class="r b">${usd(k.cost)}</td><td class="r">${pct(k.cost,cost)}</td></tr>`).join("")}</table></div>`;
-  return cards+`<div class="grid2">${burden}<div class="panel"><h3>Conclusions</h3><div class="insights">${ins}</div></div></div>`+`<div class="grid2">${trend}${kinds}</div>`;
+  return cards+`<div class="grid2">${burden}<div class="panel"><h3>Conclusions</h3><div class="insights">${ins}</div></div></div>`+economics(o)+`<div class="grid2">${trend}${kinds}</div>`;
+}
+
+// ---- #8: token economics — cost per message, messages per $1.50, plan limits, metering check ----
+// 1 credit = $0.005 of tokens; each turn debits max(1, ceil(cost / $0.005)).  Mirrors core.ts.
+const CREDIT_USD = 0.005;
+// public.billing_plans (id / credits_per_period / price_hint)
+const PLANS = [
+  { name: "Trial", credits: 40,   price: null,  hint: "free to start" },
+  { name: "Lite",  credits: 400,  price: 9.99,  hint: "$9.99 / mo" },
+  { name: "Plus",  credits: 1200, price: 19.99, hint: "$19.99 / mo" },
+];
+
+function economics(o){
+  const card=(l,v,s)=>`<div class="card"><div class="cv">${v}</div><div class="cl">${esc(l)}</div>${s?`<div class="cs">${s}</div>`:""}</div>`;
+  const cost=+o.cost_usd||0, reqs=+o.requests||0, creds=+o.credits||0;
+  const inTok=+o.input||0, outTok=+o.output||0;
+  const avgCost   = reqs ? cost/reqs : 0;
+  const avgTokens = reqs ? (inTok+outTok)/reqs : 0;
+  const avgCred   = reqs ? creds/reqs : 0;
+  const msgs150   = avgCost ? 1.50/avgCost : 0;          // «сколько сообщений, чтобы потратить $1.50»
+  const implied   = cost / CREDIT_USD;                    // кредиты по сырой стоимости, без округления
+  const overhead  = implied ? creds/implied : 0;          // накрутка от per-turn ceil
+
+  const cards=`<div class="cards">
+    ${card("Avg cost / message", usd6(avgCost), n(Math.round(avgTokens))+" tokens per message")}
+    ${card("Messages per $1.50", n(Math.round(msgs150)), "at the current average")}
+    ${card("Avg credits / message", avgCred.toFixed(2), "1 credit = $"+CREDIT_USD.toFixed(3))}
+    ${card("Token in : out", n(inTok)+" : "+n(outTok), outTok ? (inTok/outTok).toFixed(1)+"× more input than output" : "—")}
+  </div>`;
+
+  // Сверка метеринга: списанные кредиты vs кредиты, вытекающие из реальной стоимости токенов.
+  const meter=`<div class="panel"><h3>Credit metering check</h3><table>
+    <tr><th>what</th><th class="r">value</th></tr>
+    <tr><td>Real token cost (Anthropic pricing)</td><td class="r b">${usd(cost)}</td></tr>
+    <tr><td>Credits actually debited</td><td class="r b">${n(creds)}</td></tr>
+    <tr><td>Credits implied by that cost (no rounding)</td><td class="r">${n(Math.round(implied))}</td></tr>
+    <tr><td>Rounding overhead</td><td class="r">${overhead ? overhead.toFixed(2)+"×" : "—"}</td></tr>
+    </table>
+    <p class="muted">Every turn debits <code>max(1, ceil(cost / $0.005))</code>, so debited credits sit ABOVE the raw token cost. That gap is the rounding overhead — expected, not an error. A ratio far below 1× would mean under-charging.</p></div>`;
+
+  // Таблица лимитов: что план реально даёт пользователю, по ЖИВОМУ среднему.
+  const rows=PLANS.map(p=>{
+    const budget=p.credits*CREDIT_USD;
+    const msgs=avgCred ? Math.round(p.credits/avgCred) : 0;
+    const margin=(p.price&&budget) ? (p.price/budget).toFixed(1)+"×" : "—";
+    return `<tr><td>${esc(p.name)}</td><td class="r">${n(p.credits)}</td><td class="r b">${n(msgs)}</td><td class="r">${usd(budget)}</td><td class="r">${esc(p.hint)}</td><td class="r">${margin}</td></tr>`;
+  }).join("");
+  const limits=`<div class="panel"><h3>Plan limits — what a user actually gets</h3><table>
+    <tr><th>plan</th><th class="r">credits</th><th class="r">≈ messages</th><th class="r">token budget</th><th class="r">price</th><th class="r">margin</th></tr>${rows}
+    </table>
+    <p class="muted">“≈ messages” uses the LIVE average of <b>${avgCred.toFixed(2)}</b> credits/message — it moves with real usage. “Token budget” = credits × $0.005 (what the plan may spend on tokens). “Margin” = price ÷ token budget.</p></div>`;
+
+  return `<div class="panel" style="background:none;border:0;padding:0"><h3>Token economics &amp; plan limits</h3></div>`+cards+`<div class="grid2">${meter}${limits}</div>`;
 }
 function insights(o){
   const cb=o.cost_breakdown||{}; const cost=+o.cost_usd||0;
