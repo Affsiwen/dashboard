@@ -245,10 +245,50 @@ function limitStatus(u){ // #4 — approaching = ≥80% of allowance used; at li
   if((cap-rem)/cap>=0.8) return '<span class="badge">⚠︎ approaching</span>';
   return "OK";
 }
+// Apple's cut on a subscription. Margin is computed on what actually lands, not the sticker price.
+const APPLE_CUT = 0.15;
+
+// A paid plan on an anonymous account: they bought, but never secured an account, so a reinstall
+// loses their access and the first you hear of it is a refund request. Their entitlement only
+// survives if RevenueCat's TRANSFER webhook lands — and that has silently failed here before.
+function anonPaid(u){ return u.is_anonymous === true && (u.plan_id === "lite" || u.plan_id === "plus"); }
+
+// What this user is worth against what they cost us this window. Null unless we know both.
+function userMargin(u){
+  const plan = PLANS.find(p => p.name.toLowerCase() === String(u.plan_id||"").toLowerCase());
+  if(!plan) return null;
+  const net = plan.price * (1 - APPLE_CUT);
+  const cost = +u.cost_usd || 0;
+  return { net, cost, pct: (net - cost) / net * 100 };
+}
+
 function usersTable(rows){
   if(!rows.length) return `<p class="muted">No usage in this window.</p>`;
   const sorted=[...rows].sort((a,b)=>(+b.cost_usd||0)-(+a.cost_usd||0)); // #4 — highest cost first
-  return `<p class="muted">Sorted by cost (highest first). Email → iCloud anchor → anon id. Click a user to see their sessions.</p><table><tr><th>user</th><th>plan</th><th>status</th><th class="r">devices</th><th class="r">reqs</th><th class="r">sessions</th><th class="r">cost</th><th class="r">credits left</th><th>last seen</th></tr>${sorted.map(u=>`<tr><td><a data-user="${esc(u.user_id)}">${esc(u.ident)}</a>${u.is_test?' <span class="badge">test</span>':''}</td><td>${esc(u.plan_id||"—")}</td><td>${limitStatus(u)}</td><td class="r">${n(u.devices)}</td><td class="r">${n(u.reqs)}</td><td class="r">${n(u.sessions)}</td><td class="r b">${usd(u.cost_usd)}</td><td class="r">${u.credits_remaining==null?"—":n(u.credits_remaining)}</td><td>${esc(u.last_seen)}</td></tr>`).join("")}</table>`;
+  const flagged=sorted.filter(anonPaid).length;
+  // Every field below already existed in the database; the Users tab just never asked for it.
+  // period_end / credits_topup / is_anonymous arrive from admin_users — older deploys omit them,
+  // so each cell falls back to "—" rather than rendering "undefined".
+  const warn=flagged?`<p class="muted" style="color:#b45309"><b>${flagged}</b> paid ${flagged===1?"account is":"accounts are"} still anonymous — they lose access on reinstall unless RevenueCat's TRANSFER lands.</p>`:"";
+  return `<p class="muted">Sorted by cost (highest first). Email → iCloud anchor → anon id. Click a user to see their sessions.</p>${warn}<table><tr><th>user</th><th>plan</th><th>renews</th><th>status</th><th class="r">reqs</th><th class="r">cost</th><th class="r">month left</th><th class="r">top-up</th><th class="r">margin</th><th>last seen</th></tr>${sorted.map(u=>{
+    const m=userMargin(u);
+    // credits_remaining is already (monthly left + top-up), so the monthly half is the difference —
+    // no need for credits_used. Without credits_topup (older deploy) fall back to the sum as-is.
+    const monthLeft=(u.credits_remaining==null) ? "—"
+      : (u.credits_topup==null ? n(u.credits_remaining) : n(Math.max(u.credits_remaining-u.credits_topup,0)));
+    return `<tr>
+      <td><a data-user="${esc(u.user_id)}">${esc(u.ident)}</a>${u.is_test?' <span class="badge">test</span>':''}${anonPaid(u)?' <span class="badge" style="background:#fee2e2;color:#b91c1c">paid · anon</span>':''}</td>
+      <td>${esc(u.plan_id||"—")}</td>
+      <td>${esc(u.period_end||"—")}</td>
+      <td>${limitStatus(u)}</td>
+      <td class="r">${n(u.reqs)}</td>
+      <td class="r b">${usd(u.cost_usd)}</td>
+      <td class="r">${monthLeft}</td>
+      <td class="r">${u.credits_topup?n(u.credits_topup):"—"}</td>
+      <td class="r">${m?`${m.pct.toFixed(1)}%`:"—"}</td>
+      <td>${esc(u.last_seen)}</td></tr>`;
+  }).join("")}</table>
+  <p class="muted">“month left” is the plan's own allowance, “top-up” the purchased credits beside it — the app only ever sees their sum. “Margin” = (price − Apple's ${Math.round(APPLE_CUT*100)}% − this window's token cost) ÷ price after Apple.</p>`;
 }
 function sessionsTable(rows){
   const head=st.user?`<p class="muted">Sessions for ${sid(st.user)} · <a data-user="">all users</a></p>`:"";
@@ -257,7 +297,10 @@ function sessionsTable(rows){
 }
 function ioBlocks(io){
   if(!io||!io.length) return "";
-  const cost=(r)=>((+r.input_tokens*3)+(+r.output_tokens*15))/1e6;   // #5 request cost from tokens
+  // Costed by the server at the price that was in effect for that model on that day (model_pricing).
+  // It used to be (in*3 + out*15) right here, which quietly overcharged every Sonnet 5 turn by 1.5×
+  // and would have gone stale again the moment any rate moved.
+  const cost=(r)=>+r.cost_usd||0;
   return `<h3>Chat monitoring (${io.length})</h3><p class="muted">Per turn: user message, AI response, time, tokens, cost, model/mode.</p>`+io.map((r)=>{
     const um=r.user_message??r.input_text??"", ar=r.ai_response??r.output_text??"";
     const dump=(r.user_message!=null&&(r.input_text||r.output_text))?`<details class="iod"><summary>full prompt + raw completion (debug)</summary><div class="iogrid"><div><div class="iol">INPUT</div><pre>${esc(r.input_text||"")}</pre></div><div><div class="iol">OUTPUT</div><pre>${esc(r.output_text||"")}</pre></div></div></details>`:"";
@@ -266,7 +309,9 @@ function ioBlocks(io){
 }
 function sessionDetail(d){
   const reqs=d.requests||[],tx=d.transcript||[];
-  const rt=`<h3>Requests (${reqs.length})</h3><table><tr><th>ts</th><th>kind</th><th class="r">in $</th><th class="r">out $</th><th class="r">cache-r $</th><th class="r">cache-w $</th><th class="r">latency</th></tr>${reqs.map(r=>`<tr><td>${esc(r.ts)}</td><td>${esc(r.kind)}</td><td class="r">${usd6(r.input_tokens*3/1e6)}</td><td class="r">${usd6(r.output_tokens*15/1e6)}</td><td class="r">${usd6(r.cache_read_tokens*0.3/1e6)}</td><td class="r">${usd6((r.cache_creation_tokens||0)*3.75/1e6)}</td><td class="r">${n(r.latency_ms)}ms</td></tr>`).join("")}</table>`;
+  // Per-component costs come from admin_session_detail, priced per model per day. The `?? …` keeps
+  // an un-migrated deploy readable rather than printing NaN.
+  const rt=`<h3>Requests (${reqs.length})</h3><table><tr><th>ts</th><th>kind</th><th>model</th><th class="r">in $</th><th class="r">out $</th><th class="r">cache-r $</th><th class="r">cache-w $</th><th class="r">total $</th><th class="r">latency</th></tr>${reqs.map(r=>`<tr><td>${esc(r.ts)}</td><td>${esc(r.kind)}</td><td>${esc(r.model||"—")}</td><td class="r">${r.input_cost==null?"—":usd6(r.input_cost)}</td><td class="r">${r.output_cost==null?"—":usd6(r.output_cost)}</td><td class="r">${r.cache_cost==null?"—":usd6(r.cache_cost)}</td><td class="r">${r.cache_write_cost==null?"—":usd6(r.cache_write_cost)}</td><td class="r b">${r.cost_usd==null?"—":usd6(r.cost_usd)}</td><td class="r">${n(r.latency_ms)}ms</td></tr>`).join("")}</table>`;
   const t=tx.length?`<h3>Transcript (${tx.length}) — full input &amp; output</h3><div class="chat">${tx.map(m=>`<div class="msg ${m.role==='assistant'?'a':(m.role==='system'?'s':'u')}"><div class="who">${esc(m.role)}${m.widget_kind?` · <span class="badge">${esc(m.widget_kind)}</span>`:""}<span class="ts">${esc(m.created_at)}</span></div><div class="bubble">${esc(m.text)}</div></div>`).join("")}</div>`:`<h3>Transcript</h3><p class="muted">No transcript stored — captured only for allowlisted test accounts on sandbox/TestFlight builds (production stays on-device).</p>`;
   return `<p class="muted"><a data-back="1">← all sessions</a></p>`+rt+t+ioBlocks(d.io);
 }
